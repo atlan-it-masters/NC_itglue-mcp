@@ -72,6 +72,20 @@ function camelToKebab(str: string): string {
   return str.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
+/**
+ * Lowercases and strips periods so Dutch legal-suffix variants like "BV"
+ * and "B.V." (or "N.V."/"NV") compare equal, then collapses whitespace.
+ * Used by ITGlueClient.requestWithNamePartialMatch's client-side fallback
+ * matching — see that method's doc comment for why this exists at all.
+ */
+export function normalizeForFuzzyNameMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** Sort fields /user_metrics accepts, per the IT Glue developer docs. */
 export const USER_METRIC_SORT_FIELDS = [
   "id",
@@ -332,6 +346,68 @@ export class ITGlueClient {
   async get<T>(path: string, params: Record<string, unknown> = {}): Promise<T> {
     const result = await this.request<T>(path, params);
     return result.data[0];
+  }
+
+  /**
+   * Every search_* tool's inputSchema claims its `name` filter is a
+   * "partial match" — it is not. IT Glue's real API does an EXACT match on
+   * `filter[name]` and silently ignores every partial-match filter syntax
+   * we tried against a production tenant (`filter[name][contains]`,
+   * `[like]`, `[begins_with]`, trailing/leading `*`, `%...%` — all of them
+   * just return the unfiltered full list instead of erroring, which is its
+   * own trap: naively trusting a non-empty result doesn't prove the filter
+   * did anything). `filter[name]=Gebrema` returns 0 results for an org
+   * actually named "Gebrema B.V." even though the exact full name matches
+   * fine — confirmed live against a real tenant before writing this fix.
+   *
+   * This wraps `request()` so callers get what the schema always promised:
+   * try the exact filter first (cheap, correct when the caller already has
+   * the right full name), and if that comes back empty, refetch a larger
+   * unfiltered page and match `name` client-side — case-insensitively and
+   * with periods stripped, so "BV" and "B.V." (a common Dutch legal-suffix
+   * variation — Gebrema B.V. again) are treated as equivalent rather than
+   * failing a literal substring match.
+   */
+  async requestWithNamePartialMatch<T extends { name?: unknown }>(
+    path: string,
+    params: Record<string, unknown>,
+    nameValue: string | undefined
+  ): Promise<{ data: T[]; meta: PaginationMeta }> {
+    const exact = await this.request<T>(path, params);
+    if (!nameValue || exact.data.length > 0) return exact;
+
+    const { filter, page, ...rest } = params as {
+      filter?: Record<string, unknown>;
+      page?: { size?: number; number?: number };
+      [key: string]: unknown;
+    };
+    const { name: _droppedNameFilter, ...filterWithoutName } = filter ?? {};
+    const fallback = await this.request<T>(path, {
+      ...rest,
+      ...(Object.keys(filterWithoutName).length > 0 ? { filter: filterWithoutName } : {}),
+      page: { size: 1000, number: 1 },
+    });
+
+    const needle = normalizeForFuzzyNameMatch(nameValue);
+    const matched = fallback.data.filter(
+      (item) => typeof item.name === "string" && normalizeForFuzzyNameMatch(item.name).includes(needle)
+    );
+
+    const pageSize = page?.size || 50;
+    const pageNumber = page?.number || 1;
+    const start = (pageNumber - 1) * pageSize;
+    const paged = matched.slice(start, start + pageSize);
+
+    return {
+      data: paged,
+      meta: {
+        currentPage: pageNumber,
+        nextPage: start + pageSize < matched.length ? pageNumber + 1 : null,
+        prevPage: pageNumber > 1 ? pageNumber - 1 : null,
+        totalPages: Math.ceil(matched.length / pageSize) || 1,
+        totalCount: matched.length,
+      },
+    };
   }
 
   async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
@@ -1706,7 +1782,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           number: (args?.page_number as number) || 1,
         };
 
-        const result = await client.request("/organizations", params);
+        const result = await client.requestWithNamePartialMatch("/organizations", params, orgName);
         return {
           content: [
             {
@@ -1751,10 +1827,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
           if (orgSearch) {
             // Search for the organization to get its ID
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
+            const orgResult = await client.requestWithNamePartialMatch(
+              "/organizations",
+              { filter: { name: orgSearch }, page: { size: 5, number: 1 } },
+              orgSearch
+            );
             const orgs = orgResult.data as Array<Record<string, unknown>>;
             if (orgs.length === 1) {
               configOrgId = Number(orgs[0].id);
@@ -1772,8 +1849,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        const configName = args?.name as string | undefined;
         if (configOrgId) filter.organizationId = configOrgId;
-        if (args?.name) filter.name = args.name;
+        if (configName) filter.name = configName;
         if (args?.configuration_type_id) filter.configurationTypeId = args.configuration_type_id;
         if (args?.configuration_status_id) filter.configurationStatusId = args.configuration_status_id;
         if (args?.serial_number) filter.serialNumber = args.serial_number;
@@ -1787,7 +1865,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           number: (args?.page_number as number) || 1,
         };
 
-        const result = await client.request("/configurations", params);
+        const result = await client.requestWithNamePartialMatch("/configurations", params, configName);
         return {
           content: [
             {
@@ -1832,10 +1910,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "Enter an organization name to search for"
           );
           if (orgSearch) {
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
+            const orgResult = await client.requestWithNamePartialMatch(
+              "/organizations",
+              { filter: { name: orgSearch }, page: { size: 5, number: 1 } },
+              orgSearch
+            );
             const orgs = orgResult.data as Array<Record<string, unknown>>;
             if (orgs.length === 1) {
               locOrgId = Number(orgs[0].id);
@@ -1852,8 +1931,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        const locName = args?.name as string | undefined;
         if (locOrgId) filter.organizationId = locOrgId;
-        if (args?.name) filter.name = args.name;
+        if (locName) filter.name = locName;
         if (args?.city) filter.city = args.city;
         if (args?.region_id) filter.regionId = args.region_id;
         if (args?.country_id) filter.countryId = args.country_id;
@@ -1866,7 +1946,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           number: (args?.page_number as number) || 1,
         };
 
-        const result = await client.request("/locations", params);
+        const result = await client.requestWithNamePartialMatch("/locations", params, locName);
         return {
           content: [
             {
@@ -1972,10 +2052,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
           if (orgSearch) {
             // Search for the organization to get its ID
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
+            const orgResult = await client.requestWithNamePartialMatch(
+              "/organizations",
+              { filter: { name: orgSearch }, page: { size: 5, number: 1 } },
+              orgSearch
+            );
             const orgs = orgResult.data as Array<Record<string, unknown>>;
             if (orgs.length === 1) {
               pwOrgId = Number(orgs[0].id);
@@ -1993,8 +2074,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        const pwName = args?.name as string | undefined;
         if (pwOrgId) filter.organizationId = pwOrgId;
-        if (args?.name) filter.name = args.name;
+        if (pwName) filter.name = pwName;
         if (args?.password_category_id) filter.passwordCategoryId = args.password_category_id;
         if (args?.url) filter.url = args.url;
         if (args?.username) filter.username = args.username;
@@ -2008,7 +2090,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Don't show passwords in search results for security
         params.show_password = false;
 
-        const result = await client.request("/passwords", params);
+        const result = await client.requestWithNamePartialMatch("/passwords", params, pwName);
         return {
           content: [
             {
@@ -2505,8 +2587,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           flexibleAssetTypeId: args.flexible_asset_type_id,
         };
 
+        const faName = args?.name as string | undefined;
         if (args?.organization_id) filter.organizationId = args.organization_id;
-        if (args?.name) filter.name = args.name;
+        if (faName) filter.name = faName;
 
         params.filter = filter;
         if (args?.sort) params.sort = args.sort;
@@ -2515,7 +2598,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           number: (args?.page_number as number) || 1,
         };
 
-        const result = await client.request("/flexible_assets", params);
+        const result = await client.requestWithNamePartialMatch("/flexible_assets", params, faName);
         return {
           content: [
             {
