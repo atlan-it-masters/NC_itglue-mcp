@@ -4,20 +4,20 @@ A Model Context Protocol (MCP) server that provides Claude with access to IT Glu
 
 ## One-Click Deployment
 
-[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/wyre-technology/itglue-mcp/tree/main)
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/WYRE-AI/itglue-mcp/tree/main)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wyre-technology/itglue-mcp)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WYRE-AI/itglue-mcp)
 
 > [!NOTE]
 > Unlike the other Wyre MCP servers, this one talks to the IT Glue API directly and
-> has **no private `@wyre-technology/*` runtime dependency**, so the one-click build
+> has **no private `@wyre-ai/*` runtime dependency**, so the one-click build
 > does not need a GitHub Packages token — the cloud builder's `npm ci` only pulls
 > public packages. (A `read:packages` token is only needed to install the published
-> `@wyre-technology/itglue-mcp` package itself; see [Installation](#installation).)
+> `@wyre-ai/itglue-mcp` package itself; see [Installation](#installation).)
 > The DigitalOcean target builds the full Docker image and runs the complete MCP
 > server over HTTP and is the recommended path; this repo does not ship a Workers
 > entrypoint (`src/worker.ts`), so prefer DigitalOcean or the prebuilt container
-> image (`ghcr.io/wyre-technology/itglue-mcp`).
+> image (`ghcr.io/wyre-ai/itglue-mcp`).
 
 ## Installation
 
@@ -28,17 +28,17 @@ token even for public packages. Authenticate npm once, then install:
 # Authenticate npm to GitHub Packages (token needs the read:packages scope)
 export NODE_AUTH_TOKEN=$(gh auth token)   # or a PAT with read:packages
 
-npm install @wyre-technology/itglue-mcp
+npm install @wyre-ai/itglue-mcp
 ```
 
-The repo's `.npmrc` already points the `@wyre-technology` scope at GitHub Packages and
+The repo's `.npmrc` already points the `@wyre-ai` scope at GitHub Packages and
 reads the token from `NODE_AUTH_TOKEN`, so no further config is needed. The same applies
-to `npx @wyre-technology/itglue-mcp`.
+to `npx @wyre-ai/itglue-mcp`.
 
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/wyre-technology/itglue-mcp:latest
+docker pull ghcr.io/wyre-ai/itglue-mcp:latest
 ```
 
 ## Configuration
@@ -115,6 +115,11 @@ If you do need the JWT fallback, provide it in whichever way matches your deploy
 - **get_document** - Get a specific document by ID, including its sectioned body. Renders as an interactive card in MCP Apps hosts — see [Interactive Document Card](#interactive-document-card-mcp-apps)
 - **list_document_folders** - List an organization's document folders (names and IDs). Works with an API key on tenants where IT Glue exposes the Document Folders resource; falls back to a JWT otherwise — see [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations)
 
+### Attachments
+
+- **create_attachment** - Attach a file to a checklist, checklist template, configuration, contact, document, domain, flexible asset, location, password, SSL certificate or ticket. Base64 in. Also the only supported route to a picture in a document body — see [Images in documents](#images-in-documents)
+- **list_attachments** - List a record's attachments, with their download URLs
+
 ### Flexible Assets
 
 - **search_flexible_assets** - Search for flexible assets (requires flexible_asset_type_id)
@@ -148,6 +153,44 @@ hosts. The card is read-only — neutral by default, brandable via
 `MCP_BRAND_LOGO_URL`, `MCP_BRAND_PRIMARY_COLOR`, `MCP_BRAND_ACCENT_COLOR`,
 `MCP_BRAND_BG`, `MCP_BRAND_TEXT`) — no rebuild needed.
 
+### Images in documents
+
+Getting a picture into a document body is attachment-shaped, not image-shaped.
+Verified live against `api.itglue.com`, 2026-08-31:
+
+| What you try | What happens |
+|---|---|
+| Inline `<svg>` in section HTML | **Silently stripped.** The section saves, returns 200, and the diagram is simply gone from the stored content |
+| `<img src="data:image/png;base64,…">` | **Rejected with a 500**, not a validation error |
+| `POST /documents/{id}/relationships/document_images` | **404** |
+| Upload an attachment, then `<img src="https://…/attachments/{id}">` | Works, and renders inline |
+
+A caveat on that 404, because it is easy to over-read. Document images are a
+real resource — the IT Glue web editor creates them, storing a *relative* path
+like `/{org_id}/docs/{doc_id}/images/{image_id}` in the section HTML which the
+renderer swaps for a signed S3 URL on read. What could not be found is a route
+on the **documented public API** to create one; the editor appears to use an
+internal endpoint. So the right reading is "no public-API image upload route
+found", not "document images do not exist".
+
+Hence `create_attachment`: upload the file, then reference the `downloadUrl` it
+returns. The inline-SVG case is the one worth knowing about, because it looks
+like a successful write.
+
+```
+create_attachment(resource_type="documents", resource_id, file_name, content)
+→ reference the returned downloadUrl from an <img src> in update_document_section
+→ publish_document
+```
+
+Note the sanitiser also drops some inline style properties (`max-width` among
+them), so size the image to the width you want rather than relying on CSS.
+
+Pass **raw base64**. If a `data:...;base64,` prefix is left on the front the
+tool strips it rather than passing it through: IT Glue stores whatever it is
+given, so a prefixed payload uploads "successfully" and produces a corrupt file
+that only surfaces when somebody opens it.
+
 ## Usage with Claude Code
 
 Add to your `.mcp.json`:
@@ -157,7 +200,7 @@ Add to your `.mcp.json`:
   "mcpServers": {
     "itglue": {
       "command": "npx",
-      "args": ["@wyre-technology/itglue-mcp"],
+      "args": ["@wyre-ai/itglue-mcp"],
       "env": {
         "ITGLUE_API_KEY": "${ITGLUE_API_KEY}",
         "ITGLUE_REGION": "us"
@@ -178,7 +221,7 @@ Or with Docker (local stdio):
         "run", "--rm", "-i",
         "-e", "MCP_TRANSPORT=stdio",
         "-e", "ITGLUE_API_KEY",
-        "ghcr.io/wyre-technology/itglue-mcp:latest"
+        "ghcr.io/wyre-ai/itglue-mcp:latest"
       ],
       "env": {
         "ITGLUE_API_KEY": "${ITGLUE_API_KEY}"
@@ -208,7 +251,7 @@ docker run -d \
   -e ITGLUE_API_KEY="ITG.xxxxxxxx" \
   -e ITGLUE_REGION="us" \
   --restart unless-stopped \
-  ghcr.io/wyre-technology/itglue-mcp:latest
+  ghcr.io/wyre-ai/itglue-mcp:latest
 
 # Verify
 curl http://localhost:8080/health
@@ -227,7 +270,7 @@ docker run -d \
   -p 8080:8080 \
   -e AUTH_MODE=gateway \
   --restart unless-stopped \
-  ghcr.io/wyre-technology/itglue-mcp:latest
+  ghcr.io/wyre-ai/itglue-mcp:latest
 ```
 
 The gateway supplies credentials on each request via these headers:
@@ -247,7 +290,7 @@ The same transport works from an installed/built copy by setting `MCP_TRANSPORT=
 
 ```bash
 MCP_TRANSPORT=http MCP_HTTP_PORT=8080 ITGLUE_API_KEY="ITG.xxxxxxxx" \
-  npx @wyre-technology/itglue-mcp
+  npx @wyre-ai/itglue-mcp
 ```
 
 ## Example Queries

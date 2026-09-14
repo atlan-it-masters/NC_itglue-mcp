@@ -229,6 +229,39 @@ function apiErrorStatus(err: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/**
+ * Record types that IT Glue accepts attachments on, as the plural path segment
+ * used by `/:resource_type/:resource_id/relationships/attachments`.
+ *
+ * Kept as an explicit list rather than a free-text string so a wrong path is
+ * rejected by the schema instead of returning a 404 from the API.
+ */
+export const ATTACHABLE_RESOURCE_TYPES = [
+  "checklists",
+  "checklist_templates",
+  "configurations",
+  "contacts",
+  "documents",
+  "domains",
+  "flexible_assets",
+  "locations",
+  "passwords",
+  "ssl_certificates",
+  "tickets",
+] as const;
+
+/**
+ * Rejects a base64 payload that still carries its data: URI prefix.
+ *
+ * IT Glue stores whatever it is given, so a prefixed string uploads "cleanly"
+ * and produces a corrupt file that only shows up when someone opens it. Cheaper
+ * to refuse it here than to debug a broken image later.
+ */
+function stripDataUriPrefix(content: string): string {
+  const match = content.match(/^data:[^;,]*;base64,(.*)$/s);
+  return match ? match[1] : content;
+}
+
 // Simple IT Glue client
 export class ITGlueClient {
   private readonly apiKey?: string;
@@ -688,6 +721,22 @@ export function folderedDocumentsIncludedNote(): string {
 }
 
 /**
+ * Drop one top-level field from every resource in a list result.
+ *
+ * `deserializeResource` flattens `attributes` and camelCases the keys, so the
+ * fields these list tools want to withhold sit at the top level of each record.
+ */
+function omitResourceField(items: unknown[], field: string): unknown[] {
+  return items.map((item) => {
+    if (item && typeof item === "object" && field in item) {
+      const { [field]: _omitted, ...rest } = item as Record<string, unknown>;
+      return rest;
+    }
+    return item;
+  });
+}
+
+/**
  * Strip each document's full body from a `search_documents` listing.
  *
  * IT Glue's documents list endpoint embeds every document's full sectioned body
@@ -699,17 +748,25 @@ export function folderedDocumentsIncludedNote(): string {
  * retrieval stays with get_document / list_document_sections.
  *
  * Coupled to IT Glue's current field name: the body arrives as a top-level
- * `content` key (deserializeResource flattens `attributes` and camelCases keys).
- * If IT Glue renames the body field or adds another heavy one, revisit this.
+ * `content` key. If IT Glue renames the body field or adds another heavy one,
+ * revisit this.
  */
 export function stripDocumentBodies(docs: unknown[]): unknown[] {
-  return docs.map((doc) => {
-    if (doc && typeof doc === "object" && "content" in doc) {
-      const { content: _body, ...rest } = doc as Record<string, unknown>;
-      return rest;
-    }
-    return doc;
-  });
+  return omitResourceField(docs, "content");
+}
+
+/**
+ * Remove secret material from a `search_passwords` listing.
+ *
+ * `search_passwords` asks IT Glue not to send secrets (`show_password=false`),
+ * but that is a request, not a guarantee: it is one query parameter away from
+ * being dropped by a refactor, and a tenant or API version that ignores it would
+ * spill every matched secret into the model's context in a single bulk listing.
+ * Reading a secret is `get_password`'s job — one id at a time, deliberately — so
+ * the list tool strips the value on the way out regardless of what came back.
+ */
+export function stripPasswordValues(passwords: unknown[]): unknown[] {
+  return omitResourceField(passwords, "password");
 }
 
 /** Advisory that document bodies are omitted from `search_documents` results. */
@@ -719,6 +776,63 @@ export function documentBodyOmittedNote(): string {
     "item is metadata only. Call get_document (or list_document_sections) to read a specific " +
     "document's content."
   );
+}
+
+/**
+ * Warning attached to a `search_*` result that ran WITHOUT an organization
+ * filter.
+ *
+ * These tools try to scope themselves by eliciting an organization name when
+ * `organization_id` is omitted. That can fail to produce a scope in several
+ * ways: elicitation is unavailable on any client that doesn't support it
+ * — notably through the MCP gateway, which does not proxy server-initiated
+ * requests — the user can decline, and the name they give can match no
+ * organization at all. Every one of those paths silently widened the search to
+ * the whole account. A caller that asked for "the VPN password for Acme" then
+ * received an arbitrary page drawn from every organization and reasonably
+ * concluded the entry did not exist.
+ *
+ * The query still runs (organization_id is genuinely optional — an account-wide
+ * search is a legitimate request). What changes is that the result now says
+ * which search actually happened, so an unscoped miss can't be read as proof of
+ * absence. The wording deliberately does not blame a particular cause: the
+ * handler can't tell "could not ask" from "asked, and nothing matched", and
+ * naming the wrong one sends the reader after the wrong fix.
+ */
+export function unscopedSearchNote(
+  resource: string,
+  meta: PaginationMeta
+): string {
+  return (
+    `NOTE: this search was NOT scoped to an organization — no organization_id was ` +
+    `supplied and one could not be determined, ` +
+    `so it searched ${resource} across ALL organizations — returning page ${meta.currentPage} ` +
+    `of ${meta.totalPages} (${meta.totalCount} matching entries account-wide). ` +
+    `An empty or unexpected result here does NOT mean the entry is absent. ` +
+    `To scope the search, call search_organizations to find the organization's id, ` +
+    `then re-run this tool with organization_id set.`
+  );
+}
+
+/**
+ * The unscoped-search warning, emitted only when no organization filter
+ * actually went out on the wire.
+ *
+ * Deliberately keyed off the built filter rather than the caller's raw
+ * `organization_id`. The handlers apply the filter under `if (orgId)` but the
+ * warning used to be gated on `orgId === undefined`, so a falsy-but-present id
+ * (`0`, or the `NaN` from `Number(<non-numeric id>)` after an elicited lookup)
+ * fell through the gap: the scope was dropped AND the warning suppressed. One
+ * helper reading the filter keeps the two from drifting apart again.
+ */
+function unscopedSearchNoteFor(
+  resource: string,
+  filter: Record<string, unknown>,
+  meta: PaginationMeta
+): string {
+  return filter.organizationId === undefined
+    ? unscopedSearchNote(resource, meta)
+    : "";
 }
 
 /** Which filter form ultimately produced a `search_documents` listing. */
@@ -1508,6 +1622,63 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
         },
       },
       {
+        name: "create_attachment",
+        description:
+          "Attach a file to an IT Glue record, and the only supported way to get a picture into a " +
+          "document body: upload here, then reference the returned downloadUrl from an <img src>. " +
+          "Pass the file as base64 with no data: prefix.",
+        annotations: {
+          title: "Create attachment",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+        inputSchema: {
+          type: "object",
+          properties: {
+            resource_type: {
+              type: "string",
+              enum: ATTACHABLE_RESOURCE_TYPES,
+              description: "The kind of record to attach the file to",
+            },
+            resource_id: {
+              type: "number",
+              description: "ID of the record to attach the file to",
+            },
+            file_name: {
+              type: "string",
+              description: "File name including extension, e.g. 'network-diagram.png'",
+            },
+            content: {
+              type: "string",
+              description:
+                "Base64-encoded file contents. Raw base64 only - strip any 'data:...;base64,' prefix first.",
+            },
+          },
+          required: ["resource_type", "resource_id", "file_name", "content"],
+        },
+      },
+      {
+        name: "list_attachments",
+        description: "List the files attached to an IT Glue record, with their download URLs.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            resource_type: {
+              type: "string",
+              enum: ATTACHABLE_RESOURCE_TYPES,
+              description: "The kind of record to list attachments for",
+            },
+            resource_id: {
+              type: "number",
+              description: "ID of the record to list attachments for",
+            },
+          },
+          required: ["resource_type", "resource_id"],
+        },
+      },
+      {
         name: "publish_document",
         description: "Publish an IT Glue document to make section changes visible. Always call this after creating, updating, or deleting sections.",
         inputSchema: {
@@ -1866,13 +2037,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await client.requestWithNamePartialMatch("/configurations", params, configName);
+        const configText = [
+          unscopedSearchNoteFor("configurations", filter, result.meta),
+          JSON.stringify(result, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: configText }],
         };
       }
 
@@ -1947,13 +2119,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await client.requestWithNamePartialMatch("/locations", params, locName);
+        const locText = [
+          unscopedSearchNoteFor("locations", filter, result.meta),
+          JSON.stringify(result, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: locText }],
         };
       }
 
@@ -2091,13 +2264,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         params.show_password = false;
 
         const result = await client.requestWithNamePartialMatch("/passwords", params, pwName);
+        const redacted = {
+          ...result,
+          data: stripPasswordValues(result.data as unknown[]),
+        };
+        const pwText = [
+          unscopedSearchNoteFor("passwords", filter, result.meta),
+          JSON.stringify(redacted, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: pwText }],
         };
       }
 
@@ -2515,6 +2693,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         return {
           content: [{ type: "text", text: `Section ${args.section_id} deleted successfully` }],
+        };
+      }
+
+      case "create_attachment": {
+        if (!args?.resource_type || !args?.resource_id || !args?.file_name || !args?.content) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: resource_type, resource_id, file_name, and content are required",
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (!ATTACHABLE_RESOURCE_TYPES.includes(args.resource_type as typeof ATTACHABLE_RESOURCE_TYPES[number])) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: resource_type must be one of ${ATTACHABLE_RESOURCE_TYPES.join(", ")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const attachment = await client.post(
+          `/${args.resource_type}/${args.resource_id}/relationships/attachments`,
+          {
+            data: {
+              type: "attachments",
+              attributes: {
+                attachment: {
+                  content: stripDataUriPrefix(args.content as string),
+                  file_name: args.file_name,
+                },
+              },
+            },
+          }
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(attachment, null, 2) }],
+        };
+      }
+
+      case "list_attachments": {
+        if (!args?.resource_type || !args?.resource_id) {
+          return {
+            content: [{ type: "text", text: "Error: resource_type and resource_id are required" }],
+            isError: true,
+          };
+        }
+        if (!ATTACHABLE_RESOURCE_TYPES.includes(args.resource_type as typeof ATTACHABLE_RESOURCE_TYPES[number])) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: resource_type must be one of ${ATTACHABLE_RESOURCE_TYPES.join(", ")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const attachments = await client.get(
+          `/${args.resource_type}/${args.resource_id}/relationships/attachments`
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(attachments, null, 2) }],
         };
       }
 
